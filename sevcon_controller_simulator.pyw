@@ -196,6 +196,10 @@ class SevconSimulator:
         # which look like RPDO IDs to many CANopen tools. This option keeps the
         # TPDO mapping payloads from 0x1A00..0x1A03 but forces the transmit IDs.
         self.standard_tpdo_cobids = True
+        # Bench-test option: keep TPDOs transmitting even if another app sends
+        # an NMT Pre-Operational/Stop command. Many PC tools do this before SDO
+        # access, which otherwise makes TPDOs appear to start and then stop.
+        self.tpdo_in_all_nmt_states = True
         self.od = {}
         self.values: dict[tuple[int, int], int] = {}
         self.meta: dict[tuple[int, int], dict] = {}
@@ -280,10 +284,21 @@ class SevconSimulator:
             return int(self.values.get((index, sub), 0))
 
     def handle_message(self, msg):
-        if not self.enabled:
-            return
+        """Handle messages addressed to the simulated controller.
+
+        SDO server responses are intentionally allowed any time the simulator
+        has an object dictionary loaded. A real CANopen node can answer SDOs in
+        pre-operational, and this also makes bench testing easier if the user
+        forgets to press Start Simulator. Heartbeat/TPDO generation still uses
+        self.enabled.
+        """
         arbid = int(msg.arbitration_id)
         data = bytes(getattr(msg, "data", b"") or b"")
+
+        # Ignore extended CAN IDs for CANopen SDO/NMT handling.
+        if bool(getattr(msg, "is_extended_id", False)):
+            return
+
         # NMT command: COB-ID 0, data[0]=command, data[1]=node or 0 all
         if arbid == 0 and len(data) >= 2 and data[1] in (0, self.node_id):
             cmd = data[0]
@@ -291,10 +306,23 @@ class SevconSimulator:
             elif cmd == 0x02: self.nmt_state = 0x04
             elif cmd == 0x80: self.nmt_state = 0x7F
             elif cmd in (0x81, 0x82): self.nmt_state = 0x7F
+            self.app._raw_append(f"SIM NMT RX cmd=0x{cmd:02X} node={data[1]} state=0x{self.nmt_state:02X} TPDOs_continue={self.tpdo_in_all_nmt_states}")
             return
-        # SDO client -> server
-        if arbid == 0x600 + self.node_id and len(data) >= 4:
-            self._handle_sdo(data[:8])
+
+        # SDO client -> server. Default CANopen is 0x600 + node ID.
+        # Also honor 0x1200:01 if the OD has a numeric COB-ID configured.
+        sdo_rx_ids = {0x600 + self.node_id}
+        try:
+            od_sdo_rx = int(self.values.get((0x1200, 0x01), 0)) & 0x7FF
+            if od_sdo_rx:
+                sdo_rx_ids.add(od_sdo_rx)
+        except Exception:
+            pass
+
+        if arbid in sdo_rx_ids and len(data) >= 4:
+            self.app._raw_append(f"SIM SDO RX {arbid:03X} [{len(data)}] {bytes_to_hex(data)}")
+            self._handle_sdo(data.ljust(8, b"\x00")[:8])
+            return
 
     def tick(self):
         if not self.enabled or self.app.bus is None:
@@ -303,7 +331,11 @@ class SevconSimulator:
         if t >= self.next_heartbeat:
             self._send(0x700 + self.node_id, bytes([self.nmt_state]))
             self.next_heartbeat = t + self.heartbeat_ms / 1000.0
-        if self.nmt_state != 0x05:
+        # A real CANopen node normally transmits PDOs only while Operational
+        # (0x05). For this simulator, default to continuing TPDO traffic in any
+        # NMT state so an external test app cannot accidentally stop the TPDOs by
+        # sending NMT Pre-Operational/Stop during SDO probing.
+        if self.nmt_state != 0x05 and not self.tpdo_in_all_nmt_states:
             return
         with self.lock:
             tpdos = list(self.tpdos)
@@ -315,7 +347,7 @@ class SevconSimulator:
                 for m in tpdo.mappings:
                     value = self.values.get((m.index, m.sub), 0)
                     payload.extend(_pack_le(value, m.size, _dtype_signed(m.dtype)))
-            payload = bytes(payload[:8]).ljust(min(8, len(payload)), b"\x00")
+            payload = bytes(payload[:8]).ljust(8, b"\x00")
             self._send(tpdo.cob_id, payload)
             tpdo.tx_count += 1
             tpdo.next_due = t + max(10, tpdo.interval_ms) / 1000.0
@@ -326,6 +358,16 @@ class SevconSimulator:
             self.app._raw_append(f"SIM TX {arbid:03X} [{len(data)}] {bytes_to_hex(data)}")
         except Exception as e:
             self.app._raw_append(f"SIM TX ERROR: {e}")
+
+    def _sdo_tx_cobid(self) -> int:
+        """Return SDO server->client COB-ID. Default is 0x580 + node ID."""
+        try:
+            cob = int(self.values.get((0x1200, 0x02), 0)) & 0x7FF
+            if cob:
+                return cob
+        except Exception:
+            pass
+        return 0x580 + self.node_id
 
     def _handle_sdo(self, data: bytes):
         cs = data[0]
@@ -339,16 +381,16 @@ class SevconSimulator:
             n_unused = 4 - size
             resp_cs = 0x43 | (n_unused << 2)  # expedited, size indicated
             payload = bytes([resp_cs, data[1], data[2], sub]) + _pack_le(value, size, _dtype_signed(dtype)).ljust(4, b"\x00")
-            self._send(0x580 + self.node_id, payload)
+            self._send(self._sdo_tx_cobid(), payload)
         elif cs in (0x2F, 0x2B, 0x27, 0x23):  # expedited download 1/2/3/4 bytes
             size_map = {0x2F: 1, 0x2B: 2, 0x27: 3, 0x23: 4}
             wr_size = size_map.get(cs, 4)
             value = _unpack_le(data[4:4+wr_size], _dtype_signed(dtype))
             self.set_value(idx, sub, value)
-            self._send(0x580 + self.node_id, bytes([0x60, data[1], data[2], sub, 0, 0, 0, 0]))
+            self._send(self._sdo_tx_cobid(), bytes([0x60, data[1], data[2], sub, 0, 0, 0, 0]))
         else:
             # abort: command specifier not valid/unsupported
-            self._send(0x580 + self.node_id, bytes([0x80, data[1], data[2], sub, 0x00, 0x00, 0x04, 0x05]))
+            self._send(self._sdo_tx_cobid(), bytes([0x80, data[1], data[2], sub, 0x00, 0x00, 0x04, 0x05]))
 
 
 class CanMonitorApp(tk.Tk):
